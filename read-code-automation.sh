@@ -16,6 +16,12 @@
 
 set -euo pipefail
 
+# mapfile -d '' needs bash >= 4.4 (macOS ships 3.2 by default)
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'read-code: bash >= 4.4 required (found %s)\n' "$BASH_VERSION" >&2
+    exit 1
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL VARIABLES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -28,15 +34,15 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CODE_DUMP_FILE="${CODE_DUMP_FILE:-$PROJECT_ROOT/project-code.txt}"
 
 # ►► THE GLOBAL BUFFER ◄◄
-# Code is accumulated in memory in this one variable,
-# then flushed to $CODE_DUMP_FILE.
-# FLUSH_AT keeps memory bounded on big repos.
+# Headers/manifest are accumulated here, then flushed to $CODE_DUMP_FILE.
+# File *contents* are streamed straight to disk (see dump_file), so memory
+# stays bounded no matter how big the repo is.
 CODE_DUMP=""
 CODE_DUMP_BYTES=0
 FLUSH_AT=$((4 * 1024 * 1024)) # Flush to disk every ~4 MB
 
 # Behaviour knobs
-LINE_NUMBERS=1                  # 1 = prefix " 12\t" like Claude's reader
+LINE_NUMBERS=1                  # 1 = prefix "    12\t" like Claude's reader
 MAX_FILE_BYTES=$((512 * 1024))  # Skip any single file larger than this
 MAX_FILE_LINES=0                # 0 = unlimited; else truncate long files
 APPEND=0                        # 1 = append to the txt instead of truncating
@@ -44,6 +50,8 @@ TRACKED_ONLY=0                  # 1 = git-tracked files only (skip new files)
 QUIET=0
 
 # Paths never worth dumping (match against repo-relative path).
+# Note: in [[ path == glob ]], '*' also matches '/', so 'vendor/*'
+# already covers nested paths.
 EXCLUDE_GLOBS=(
     'vendor/*'
     '*/vendor/*'
@@ -87,7 +95,6 @@ FILES=()
 SKIPPED=()
 FILES_WRITTEN=0
 LINES_TOTAL=0
-BYTES_TOTAL=0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,14 +111,20 @@ die() {
 }
 
 usage() {
-    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^#\s\?//'
-
     cat <<'USAGE'
+read-code.sh — dump every readable source file into ONE txt file.
+
+Usage:
+  ./read-code.sh                       -> ./project-code.txt
+  ./read-code.sh -o /tmp/dump.txt      custom output file
+  ./read-code.sh -x '*_test.go' -x 'docs/*'
+  CODE_DUMP_FILE=/tmp/x.txt ./read-code.sh
+
 Options:
   -o, --output FILE       the single txt file to write (default: project-code.txt)
   -r, --root DIR          project root to read (default: script directory)
   -a, --append            append instead of overwriting the txt
-  -n, --no-line-numbers   dump raw content without " 12\t" prefixes
+  -n, --no-line-numbers   dump raw content without "    12\t" prefixes
   -x, --exclude GLOB      skip paths matching GLOB (repeatable)
   -i, --include GLOB      dump ONLY paths matching GLOB (repeatable)
   -s, --max-size BYTES    skip files bigger than BYTES (default: 524288)
@@ -122,11 +135,16 @@ Options:
 USAGE
 }
 
-# Append a chunk to the global CODE_DUMP buffer,
-# flushing when it gets big.
+require_number() {
+    # require_number <flag> <value>
+    [[ $2 =~ ^[0-9]+$ ]] || die "$1 expects a non-negative integer, got: $2"
+}
+
+# Append a LINE (newline added) to the global buffer, flushing when big.
+# $1 may itself contain newlines.
 buf() {
-    CODE_DUMP+="$1"
-    CODE_DUMP_BYTES=$(( CODE_DUMP_BYTES + ${#1} ))
+    CODE_DUMP+="$1"$'\n'
+    CODE_DUMP_BYTES=$(( CODE_DUMP_BYTES + ${#1} + 1 ))
 
     if (( CODE_DUMP_BYTES >= FLUSH_AT )); then
         flush_buffer
@@ -139,7 +157,6 @@ flush_buffer() {
 
     printf '%s' "$CODE_DUMP" >> "$CODE_DUMP_FILE"
 
-    BYTES_TOTAL=$(( BYTES_TOTAL + CODE_DUMP_BYTES ))
     CODE_DUMP=""
     CODE_DUMP_BYTES=0
 }
@@ -149,12 +166,12 @@ matches_any() {
     local path=$1
     shift
 
-    local g
+    local base g
+    base=$(basename "$path")
 
     for g in "$@"; do
         # shellcheck disable=SC2053
-        [[ $path == $g ]] && return 0
-        [[ $(basename "$path") == $g ]] && return 0
+        [[ $path == $g || $base == $g ]] && return 0
     done
 
     return 1
@@ -162,17 +179,24 @@ matches_any() {
 
 is_text_file() {
     # Binary files are never dumped.
+    # Empty regex matches every line (incl. blank ones), so whitespace-only
+    # files count as text; -I makes grep report binary files as non-matching.
     local f=$1
 
     [[ -s $f ]] || return 0 # Empty file counts as text
 
-    grep -Iq . "$f" 2>/dev/null
+    LC_ALL=C grep -Iq -e '' "$f" 2>/dev/null
 }
 
 file_size() {
     stat -c %s "$1" 2>/dev/null ||
         stat -f %z "$1" 2>/dev/null ||
         echo 0
+}
+
+count_lines() {
+    # Unlike `wc -l`, this counts a final line with no trailing newline.
+    awk 'END { print NR }' "$1"
 }
 
 
@@ -183,7 +207,10 @@ file_size() {
 
 collect_files() {
     local -a raw=()
-    local rel
+    local rel dump_abs
+
+    # Absolute path of the output file, so re-runs never dump the dump.
+    dump_abs=$(cd "$(dirname "$CODE_DUMP_FILE")" && pwd)/$(basename "$CODE_DUMP_FILE")
 
     if git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 
@@ -202,12 +229,14 @@ collect_files() {
     else
         log "· not a git repo — falling back to find(1)"
 
+        # -print0 instead of GNU-only -printf '%P\0', so this works on BSD/macOS
         mapfile -d '' -t raw < <(
             find "$PROJECT_ROOT" \
                 -type f \
                 -not -path '*/.git/*' \
-                -printf '%P\0'
+                -print0
         )
+        raw=("${raw[@]#"$PROJECT_ROOT/"}")
     fi
 
     for rel in "${raw[@]}"; do
@@ -215,7 +244,8 @@ collect_files() {
 
         local abs="$PROJECT_ROOT/$rel"
 
-        [[ -f $abs ]] || continue # staged-deleted
+        [[ -f $abs ]] || continue          # staged-deleted
+        [[ $abs == "$dump_abs" ]] && continue # never dump ourselves
 
         if (( ${#INCLUDE_GLOBS[@]} )) &&
             ! matches_any "$rel" "${INCLUDE_GLOBS[@]}"; then
@@ -263,14 +293,14 @@ write_header() {
     commit=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo n/a)
 
     buf "################################################################################
-PROJECT CODE DUMP
-# root : $PROJECT_ROOT
+# PROJECT CODE DUMP
+# root   : $PROJECT_ROOT
 # branch : $branch @ $commit
-# date : $(date '+%Y-%m-%d %H:%M:%S %Z')
-# files : ${#FILES[@]} dumped, ${#SKIPPED[@]} skipped
+# date   : $(date '+%Y-%m-%d %H:%M:%S %Z')
+# files  : ${#FILES[@]} dumped, ${#SKIPPED[@]} skipped
 ################################################################################
 
-=============================== FILE MANIFEST ================================"
+=============================== FILE MANIFEST ================================="
 
     local i=1
     local f
@@ -281,10 +311,10 @@ PROJECT CODE DUMP
     done
 
     if (( ${#SKIPPED[@]} )); then
-        buf "------------------------------- SKIPPED --------------------------------------"
+        buf "------------------------------- SKIPPED ---------------------------------------"
 
         for f in "${SKIPPED[@]}"; do
-            buf " $f"
+            buf "      $f"
         done
     fi
 
@@ -293,39 +323,45 @@ PROJECT CODE DUMP
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. READ EACH FILE INTO THE GLOBAL BUFFER
+# 3. STREAM EACH FILE INTO THE ONE TXT FILE
 # ══════════════════════════════════════════════════════════════════════════════
 
 dump_file() {
     local rel=$1
-    local abs="$PROJECT_ROOT/$1"
-    local lines
-    local content
-    local truncated=""
+    local abs="$PROJECT_ROOT/$rel"
+    local lines shown
 
-    lines=$(wc -l < "$abs" | tr -d ' ')
+    lines=$(count_lines "$abs")
+    shown=$lines
 
     if (( MAX_FILE_LINES > 0 && lines > MAX_FILE_LINES )); then
-        content=$(head -n "$MAX_FILE_LINES" "$abs")
-        truncated="... [truncated: $lines total lines, showing first $MAX_FILE_LINES]"
-        lines=$MAX_FILE_LINES
-    else
-        content=$(cat "$abs")
-    fi
-
-    if (( LINE_NUMBERS )); then
-        content=$(printf '%s\n' "$content" | awk '{ printf "%6d\t%s\n", NR, $0 }')
+        shown=$MAX_FILE_LINES
     fi
 
     buf "================================================================================
 FILE: $rel
 LINES: $lines
-================================================================================
-$content
-$truncated"
+================================================================================"
+
+    # Keep ordering correct, then stream the file content directly to disk —
+    # no command substitution, so huge files never sit in shell memory and
+    # trailing newlines / whitespace aren't mangled.
+    flush_buffer
+
+    awk -v max="$shown" -v num="$LINE_NUMBERS" '
+        NR > max { exit }
+        num      { printf "%6d\t%s\n", NR, $0; next }
+                 { print }
+    ' "$abs" >> "$CODE_DUMP_FILE"
+
+    if (( shown < lines )); then
+        buf "... [truncated: $lines total lines, showing first $shown]"
+    fi
+
+    buf ""
 
     FILES_WRITTEN=$(( FILES_WRITTEN + 1 ))
-    LINES_TOTAL=$(( LINES_TOTAL + lines ))
+    LINES_TOTAL=$(( LINES_TOTAL + shown ))
 }
 
 
@@ -337,11 +373,13 @@ main() {
     while (( $# )); do
         case $1 in
             -o|--output)
+                [[ ${2:-} ]] || die "$1 needs a value"
                 CODE_DUMP_FILE=$2
                 shift 2
                 ;;
             -r|--root)
-                PROJECT_ROOT=$(cd "$2" && pwd)
+                [[ ${2:-} ]] || die "$1 needs a value"
+                PROJECT_ROOT=$(cd "$2" 2>/dev/null && pwd) || die "no such directory: $2"
                 shift 2
                 ;;
             -a|--append)
@@ -353,18 +391,22 @@ main() {
                 shift
                 ;;
             -x|--exclude)
+                [[ ${2:-} ]] || die "$1 needs a value"
                 EXCLUDE_GLOBS+=("$2")
                 shift 2
                 ;;
             -i|--include)
+                [[ ${2:-} ]] || die "$1 needs a value"
                 INCLUDE_GLOBS+=("$2")
                 shift 2
                 ;;
             -s|--max-size)
+                require_number "$1" "${2:-}"
                 MAX_FILE_BYTES=$2
                 shift 2
                 ;;
             -l|--max-lines)
+                require_number "$1" "${2:-}"
                 MAX_FILE_LINES=$2
                 shift 2
                 ;;
@@ -403,7 +445,7 @@ main() {
     local f
 
     for f in "${FILES[@]}"; do
-        log " + $f"
+        log "  + $f"
         dump_file "$f"
     done
 
@@ -413,7 +455,7 @@ main() {
 
     flush_buffer
 
-    log "· wrote $CODE_DUMP_FILE"
+    log "· wrote  $CODE_DUMP_FILE"
     log "· totals $FILES_WRITTEN files · $LINES_TOTAL lines · $(file_size "$CODE_DUMP_FILE") bytes"
 
     printf '%s\n' "$CODE_DUMP_FILE"
