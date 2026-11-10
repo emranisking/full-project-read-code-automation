@@ -1,2 +1,2 @@
 To run the automation
-./read-code.sh -r /home/emran/project/Classroom-Management-Backend
+./read-code-automation.sh -r /home/emran/project/Classroom-Management-Backend
